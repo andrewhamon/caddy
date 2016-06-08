@@ -65,7 +65,7 @@ type Instance struct {
 	caddyfileInput Input
 
 	// wg is used to wait for all servers to shut down
-	wg sync.WaitGroup
+	wg *sync.WaitGroup
 
 	// servers is the list of servers with their listeners...
 	servers []serverListener
@@ -119,6 +119,9 @@ func (i *Instance) shutdownCallbacks() []error {
 func (i *Instance) Restart(newCaddyfile Input) (*Instance, error) {
 	log.Println("[INFO] Reloading")
 
+	i.wg.Add(1)
+	defer i.wg.Done()
+
 	// run restart callbacks
 	for _, fn := range i.onRestart {
 		err := fn()
@@ -142,7 +145,7 @@ func (i *Instance) Restart(newCaddyfile Input) (*Instance, error) {
 	}
 
 	// create new instance; if the restart fails, it is simply discarded
-	newInst := &Instance{serverType: newCaddyfile.ServerType()}
+	newInst := &Instance{serverType: newCaddyfile.ServerType(), wg: i.wg}
 
 	// attempt to start new instance
 	err := startWithListenerFds(newCaddyfile, newInst, restartFds)
@@ -159,6 +162,8 @@ func (i *Instance) Restart(newCaddyfile Input) (*Instance, error) {
 		}
 	}
 	instancesMu.Unlock()
+
+	i.Stop()
 
 	log.Println("[INFO] Reloading complete")
 
@@ -365,7 +370,7 @@ func (i *Instance) Caddyfile() Input {
 // This function blocks until all the servers are listening.
 func Start(cdyfile Input) (*Instance, error) {
 	writePidFile()
-	inst := &Instance{serverType: cdyfile.ServerType()}
+	inst := &Instance{serverType: cdyfile.ServerType(), wg: new(sync.WaitGroup)}
 	return inst, startWithListenerFds(cdyfile, inst, nil)
 }
 
@@ -405,13 +410,10 @@ func startWithListenerFds(cdyfile Input, inst *Instance, restartFds map[string]r
 		return err
 	}
 
-	if restartFds == nil {
-		// run startup callbacks since this is not a restart
-		for _, startupFunc := range inst.onStartup {
-			err := startupFunc()
-			if err != nil {
-				return err
-			}
+	for _, startupFunc := range inst.onStartup {
+		err := startupFunc()
+		if err != nil {
+			return err
 		}
 	}
 
@@ -532,7 +534,6 @@ func startServers(serverList []Server, inst *Instance, restartFds map[string]res
 					return err
 				}
 				file.Close()
-				delete(restartFds, addr)
 			}
 		}
 
@@ -550,15 +551,6 @@ func startServers(serverList []Server, inst *Instance, restartFds map[string]res
 		}(s, ln, inst)
 
 		inst.servers = append(inst.servers, serverListener{server: s, listener: ln})
-	}
-
-	// Close the remaining (unused) file descriptors to free up resources
-	// and stop old servers that aren't used anymore
-	for key, old := range restartFds {
-		if err := old.server.Stop(); err != nil {
-			log.Printf("[ERROR] Stopping %s: %v", old.server.Address(), err)
-		}
-		delete(restartFds, key)
 	}
 
 	// Log errors that may be returned from Serve() calls,
